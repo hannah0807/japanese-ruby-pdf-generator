@@ -2,6 +2,8 @@
 
 from pathlib import Path
 import subprocess
+import tempfile
+import time
 
 from core.ruby_converter import text_file_to_paragraphs
 from core.html_builder import build_html
@@ -20,9 +22,29 @@ def find_edge_path() -> Path | None:
     return None
 
 
+def normalize_windows_path(path_text: str) -> Path:
+    path_text = path_text.strip().strip('"').replace("￥", "\\").replace("¥", "\\")
+    return Path(path_text).resolve()
+
+
+def wait_for_pdf(output_pdf: Path, timeout_seconds: int = 60) -> bool:
+    deadline = time.time() + timeout_seconds
+
+    while time.time() < deadline:
+        try:
+            if output_pdf.exists() and output_pdf.stat().st_size > 0:
+                return True
+        except OSError:
+            pass
+
+        time.sleep(0.5)
+
+    return False
+
+
 def generate_pdf(txt_path: str, output_pdf: str, cfg: dict) -> None:
-    txt_path = Path(txt_path.strip().strip('"')).resolve()
-    output_pdf = Path(output_pdf.strip().strip('"')).resolve()
+    txt_path = normalize_windows_path(txt_path)
+    output_pdf = normalize_windows_path(output_pdf)
 
     if not txt_path.exists():
         raise FileNotFoundError(f"输入文件不存在：{txt_path}")
@@ -34,30 +56,42 @@ def generate_pdf(txt_path: str, output_pdf: str, cfg: dict) -> None:
     content = text_file_to_paragraphs(txt_path)
     html_content = build_html(content, cfg, preview=False)
 
-    temp_html = (txt_path.parent / "temp_print.html").resolve()
-    temp_html.write_text(html_content, encoding="utf-8")
+    output_pdf.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd = [
-        str(edge_path),
-        "--headless",
-        "--disable-gpu",
-        f"--print-to-pdf={str(output_pdf)}",
-        temp_html.as_uri()
-    ]
+    with tempfile.TemporaryDirectory(prefix="ruby_pdf_", dir=output_pdf.parent, ignore_cleanup_errors=True) as temp_dir:
+        temp_path = Path(temp_dir)
+        temp_html = temp_path / "print.html"
+        edge_profile = temp_path / "edge-profile"
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+        temp_html.write_text(html_content, encoding="utf-8")
 
-    try:
-        temp_html.unlink(missing_ok=True)
-    except Exception:
-        pass
+        cmd = [
+            str(edge_path),
+            "--headless=new",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--no-pdf-header-footer",
+            "--print-to-pdf-no-header",
+            f"--user-data-dir={str(edge_profile)}",
+            f"--print-to-pdf={str(output_pdf)}",
+            temp_html.as_uri(),
+        ]
 
-    if result.returncode != 0:
-        raise RuntimeError(
-            "Edge 生成 PDF 失败。\n\n"
-            f"stdout:\n{result.stdout}\n\n"
-            f"stderr:\n{result.stderr}"
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
-    if not output_pdf.exists():
-        raise RuntimeError("PDF 未生成")
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Edge 生成 PDF 失败。\n\n"
+                f"stdout:\n{result.stdout}\n\n"
+                f"stderr:\n{result.stderr}"
+            )
+
+        if wait_for_pdf(output_pdf):
+            return
+
+    if output_pdf.exists():
+        return
+
+    raise RuntimeError(f"PDF 未生成：{output_pdf}")
